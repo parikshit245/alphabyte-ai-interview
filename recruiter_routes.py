@@ -11,10 +11,13 @@ All endpoints for the recruiter interview flow:
   - MongoDB full-document retrieval
 """
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form
 from pydantic import BaseModel
 from typing import List, Optional, Dict
 from datetime import datetime
+import csv
+import io
+import uuid
 
 from models import (
     SkillResponse,
@@ -932,3 +935,206 @@ async def get_interview_from_mongo(interview_id: str):
         status_code=status.HTTP_404_NOT_FOUND,
         detail=f"Interview '{interview_id}' not found in MongoDB or cache",
     )
+
+
+# =====================================================================
+#  POST — Upload CSV to add questions to Neo4j database
+# =====================================================================
+@router.post(
+    "/upload-questions-csv",
+    summary="Upload a CSV file to bulk-add questions to the Neo4j database",
+)
+async def upload_questions_csv(
+    company_id: str = Form(..., description="Company ID to attach to every question"),
+    file: UploadFile = File(..., description="CSV file with question data"),
+    db=Depends(get_db),
+):
+    """
+    Accepts a CSV file and a company_id.
+    Each row creates/merges the full hierarchy in Neo4j:
+        QuestionList → Domain → Skill → Topic → Difficulty → Question → Answer
+
+    **Required CSV columns:**
+    `question_id`, `title`, `description`, `hints`, `example`,
+    `difficulty_level` (Easy/Medium/Hard),
+    `topic_id`, `topic_name`,
+    `skill_id`, `skill_name`,
+    `domain_id`, `domain_name`,
+    `answer_id`, `explanation`, `code`, `code_explanation`
+
+    **Optional columns:**
+    `list_id`, `list_name`, `list_description`,
+    `topic_description`, `skill_description`, `domain_description`,
+    `difficulty_id`
+
+    The provided `company_id` is appended to each question's `company_ids` array.
+    """
+    # ── Validate file type ──
+    if not file.filename.endswith(".csv"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Only .csv files are accepted",
+        )
+
+    # ── Read & parse CSV ──
+    content = await file.read()
+    try:
+        text = content.decode("utf-8-sig")  # handles BOM
+    except UnicodeDecodeError:
+        text = content.decode("latin-1")
+
+    reader = csv.DictReader(io.StringIO(text))
+    rows = list(reader)
+
+    if not rows:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="CSV file is empty or has no data rows",
+        )
+
+    # ── Validate required columns ──
+    required_cols = {
+        "question_id", "title", "description",
+        "difficulty_level",
+        "topic_id", "topic_name",
+        "skill_id", "skill_name",
+        "domain_id", "domain_name",
+        "answer_id", "explanation",
+    }
+    header_cols = set(rows[0].keys())
+    missing = required_cols - header_cols
+    if missing:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"CSV is missing required columns: {sorted(missing)}",
+        )
+
+    # ── Insert each row into Neo4j ──
+    loaded = 0
+    skipped = 0
+    errors_list: List[str] = []
+
+    with db.session() as s:
+        for idx, row in enumerate(rows, start=2):  # row 2 = first data row
+            try:
+                # Build IDs / defaults for optional columns
+                list_id = row.get("list_id", "").strip() or "QL_DEFAULT"
+                list_name = row.get("list_name", "").strip() or "Default Question List"
+                list_desc = row.get("list_description", "").strip() or None
+                domain_desc = row.get("domain_description", "").strip() or None
+                skill_desc = row.get("skill_description", "").strip() or None
+                topic_desc = row.get("topic_description", "").strip() or None
+                diff_level = row["difficulty_level"].strip()
+                diff_id = (
+                    row.get("difficulty_id", "").strip()
+                    or f"DF_{row['topic_id'].strip()}_{diff_level.upper()}"
+                )
+
+                # company_ids: merge with existing
+                s.run("""
+                    MERGE (ql:QuestionList {list_id: $list_id})
+                    ON CREATE SET
+                        ql.name        = $list_name,
+                        ql.description = $list_desc,
+                        ql.created_at  = datetime()
+
+                    MERGE (d:Domain {domain_id: $domain_id})
+                    ON CREATE SET
+                        d.name        = $domain_name,
+                        d.description = $domain_desc
+
+                    MERGE (ql)-[:HAS_DOMAIN]->(d)
+
+                    MERGE (sk:Skill {skill_id: $skill_id})
+                    ON CREATE SET
+                        sk.name        = $skill_name,
+                        sk.description = $skill_desc
+
+                    MERGE (d)-[:HAS_SKILL]->(sk)
+
+                    MERGE (t:Topic {topic_id: $topic_id})
+                    ON CREATE SET
+                        t.name        = $topic_name,
+                        t.description = $topic_desc
+
+                    MERGE (sk)-[:HAS_TOPIC]->(t)
+
+                    MERGE (df:Difficulty {difficulty_id: $diff_id})
+                    ON CREATE SET
+                        df.level = $diff_level
+
+                    MERGE (t)-[:HAS_DIFFICULTY]->(df)
+
+                    MERGE (q:Question {question_id: $question_id})
+                    ON CREATE SET
+                        q.title       = $title,
+                        q.description = $description,
+                        q.hints       = $hints,
+                        q.example     = $example,
+                        q.company_ids = [$company_id],
+                        q.created_at  = datetime()
+                    ON MATCH SET
+                        q.updated_at  = datetime(),
+                        q.company_ids = CASE
+                            WHEN NOT $company_id IN coalesce(q.company_ids, [])
+                            THEN coalesce(q.company_ids, []) + $company_id
+                            ELSE q.company_ids
+                        END
+
+                    MERGE (df)-[:HAS_QUESTION]->(q)
+
+                    MERGE (a:Answer {answer_id: $answer_id})
+                    ON CREATE SET
+                        a.explanation      = $explanation,
+                        a.code             = $code,
+                        a.code_explanation = $code_explanation,
+                        a.company_id       = $company_id
+                    ON MATCH SET
+                        a.explanation      = $explanation,
+                        a.code             = $code,
+                        a.code_explanation = $code_explanation,
+                        a.company_id       = $company_id
+
+                    MERGE (q)-[:HAS_ANSWER]->(a)
+                """, {
+                    "list_id":          list_id,
+                    "list_name":        list_name,
+                    "list_desc":        list_desc,
+                    "domain_id":        row["domain_id"].strip(),
+                    "domain_name":      row["domain_name"].strip(),
+                    "domain_desc":      domain_desc,
+                    "skill_id":         row["skill_id"].strip(),
+                    "skill_name":       row["skill_name"].strip(),
+                    "skill_desc":       skill_desc,
+                    "topic_id":         row["topic_id"].strip(),
+                    "topic_name":       row["topic_name"].strip(),
+                    "topic_desc":       topic_desc,
+                    "diff_id":          diff_id,
+                    "diff_level":       diff_level,
+                    "question_id":      row["question_id"].strip(),
+                    "title":            row["title"].strip(),
+                    "description":      row.get("description", "").strip() or None,
+                    "hints":            row.get("hints", "").strip() or None,
+                    "example":          row.get("example", "").strip() or None,
+                    "company_id":       company_id,
+                    "answer_id":        row["answer_id"].strip(),
+                    "explanation":      row.get("explanation", "").strip() or None,
+                    "code":             row.get("code", "").strip() or None,
+                    "code_explanation": row.get("code_explanation", "").strip() or None,
+                })
+
+                loaded += 1
+
+            except Exception as e:
+                skipped += 1
+                errors_list.append(f"Row {idx}: {str(e)}")
+
+    return {
+        "status": "completed",
+        "company_id": company_id,
+        "file_name": file.filename,
+        "total_rows": len(rows),
+        "loaded": loaded,
+        "skipped": skipped,
+        "errors": errors_list,
+    }
