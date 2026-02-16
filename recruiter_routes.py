@@ -12,6 +12,7 @@ All endpoints for the recruiter interview flow:
 """
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel
 from typing import List, Optional, Dict
 from datetime import datetime
 
@@ -29,59 +30,18 @@ from dependencies import (
     to_native_dt,
 )
 
+
+# ── Request body for domain selection ────────────────────────────────
+class DomainSelectRequest(BaseModel):
+    domain_id: str
+    job_description: str
+
 router = APIRouter(tags=["Recruiter / Interviews"])
 
 
 # =====================================================================
 #  QUESTION GRAPH TRAVERSAL ENDPOINTS
 # =====================================================================
-
-# ── GET skills from a domain ─────────────────────────────────────────
-@router.get(
-    "/domains/{domain_id}/skills",
-    response_model=List[SkillResponse],
-    summary="Fetch all Skills under a Domain",
-)
-async def get_skills_by_domain(domain_id: str, db=Depends(get_db)):
-    """
-    Traverse  Domain -[:HAS_SKILL]-> Skill
-    and return every Skill node linked to the given domain_id.
-    """
-    with db.session() as s:
-        result = s.run(
-            """
-            MATCH (d:Domain {domain_id: $did})-[:HAS_SKILL]->(sk:Skill)
-            OPTIONAL MATCH (sk)-[:HAS_TOPIC]->(t:Topic)
-            RETURN sk, count(t) AS topic_count
-            ORDER BY sk.name
-            """,
-            {"did": domain_id},
-        )
-        records = list(result)
-
-    if not records:
-        with db.session() as s:
-            exists = s.run(
-                "MATCH (d:Domain {domain_id: $did}) RETURN d LIMIT 1",
-                {"did": domain_id},
-            ).single()
-        if not exists:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Domain '{domain_id}' not found",
-            )
-        return []
-
-    return [
-        SkillResponse(
-            skill_id=r["sk"]["skill_id"],
-            name=r["sk"]["name"],
-            description=r["sk"].get("description"),
-            topic_count=r["topic_count"],
-        )
-        for r in records
-    ]
-
 
 # ── GET topics from a skill ──────────────────────────────────────────
 @router.get(
@@ -443,6 +403,78 @@ async def get_all_skills(db=Depends(get_db)):
 #  INTERVIEW MANAGEMENT ENDPOINTS
 # =====================================================================
 
+# ── POST — Select a domain for an interview + job description ────────
+@router.post(
+    "/interviews/{interview_id}/domain",
+    summary="Select a domain and provide job description for an interview",
+)
+async def select_interview_domain(
+    interview_id: str,
+    body: DomainSelectRequest,
+    db=Depends(get_db),
+):
+    """
+    Recruiter selects a domain and supplies a job description.
+    Both are saved to the in-memory interview cache.
+    Returns the domain info along with its skills so the recruiter
+    can proceed to skill selection.
+    """
+    domain_id = body.domain_id
+    job_description = body.job_description
+
+    # ── Validate domain & fetch its skills ──
+    with db.session() as s:
+        domain_row = s.run(
+            "MATCH (d:Domain {domain_id: $did}) RETURN d LIMIT 1",
+            {"did": domain_id},
+        ).single()
+
+    if not domain_row:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Domain '{domain_id}' not found",
+        )
+
+    with db.session() as s:
+        skill_rows = list(s.run(
+            """
+            MATCH (d:Domain {domain_id: $did})-[:HAS_SKILL]->(sk:Skill)
+            OPTIONAL MATCH (sk)-[:HAS_TOPIC]->(t:Topic)
+            RETURN sk, count(t) AS topic_count
+            ORDER BY sk.name
+            """,
+            {"did": domain_id},
+        ))
+
+    skills = [
+        {
+            "skill_id": r["sk"]["skill_id"],
+            "name": r["sk"]["name"],
+            "description": r["sk"].get("description"),
+            "topic_count": r["topic_count"],
+        }
+        for r in skill_rows
+    ]
+
+    # ── Save to cache ──
+    _interview_cache.setdefault(interview_id, {})
+    _interview_cache[interview_id].update({
+        "interview_id": interview_id,
+        "domain_id": domain_id,
+        "domain_name": domain_row["d"].get("name"),
+        "job_description": job_description,
+        "created_at": datetime.utcnow().isoformat(),
+    })
+
+    return {
+        "interview_id": interview_id,
+        "domain_id": domain_id,
+        "domain_name": domain_row["d"].get("name"),
+        "job_description": job_description,
+        "skills": skills,
+    }
+
+
 # ── POST — Fetch questions (3:4:3) and cache them for an interview ───
 @router.post(
     "/interviews/{interview_id}/upload-questions",
@@ -595,6 +627,9 @@ async def upload_interview_questions(
         "questions_with_answers": questions_with_answers,
         "skills": _interview_cache[interview_id].get("skills", []),
         "skill_ids": _interview_cache[interview_id].get("skill_ids", []),
+        "domain_id": _interview_cache[interview_id].get("domain_id"),
+        "domain_name": _interview_cache[interview_id].get("domain_name"),
+        "job_description": _interview_cache[interview_id].get("job_description"),
     }
     col = get_interviews_collection()
     col.replace_one({"_id": interview_id}, mongo_doc, upsert=True)
