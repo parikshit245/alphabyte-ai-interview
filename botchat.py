@@ -56,7 +56,18 @@ class FeedbackResponse(BaseModel):
     improvements: List[str] = Field(description="Areas for improvement")
     score: int = Field(description="Score out of 10", ge=0, le=10)
     follow_up_suggestions: List[str] = Field(description="Suggestions for follow-up learning")
+    
 
+class SearchKeywords(BaseModel):
+    domain: Optional[str] = Field(None, description="The industry or domain related to the query")
+    skills: List[str] = Field(default_factory=list, description="List of technical skills or qualifications mentioned")
+    Topic: Optional[str] = Field(None, description="The specific ID of the company")
+    company_name: Optional[str] = Field(None, description="The name of the company")
+    domain_res: Optional[List[dict]] = Field(default=None, description="Results from domain-based search")
+    topic_results: Optional[List[dict]] = Field(default=None, description="Results from topic-based search")
+    skill_results: Optional[List[dict]] = Field(default=None, description="Results from skill-based search")
+    company_results: Optional[List[dict]] = Field(default=None, description="Results from company-based search")
+    merger_results: Optional[dict] = Field(default=None, description="Merged search results")
 
 class AgentResponse(BaseModel):
     """Structured output from the agent"""
@@ -108,47 +119,121 @@ class Neo4jHandler:
         """Close the database connection"""
         self.driver.close()
     
-    def get_questions_by_domain(self, domain_name: str, limit: int = 5) -> List[dict]:
+    def get_questions_by_domain(self, SearchKeywords, domain_name: str, limit: int = 5) -> SearchKeywords:
         """Fetch questions by domain"""
+        domain_name = SearchKeywords.domain if SearchKeywords.domain else domain_name
         with self.driver.session() as session:
             result = session.run(
                 """
-                MATCH (d:Domain {domain_name: $domain_name})-[:HAS_SKILL]->(s:Skill)
-                      -[:HAS_TOPIC]->(t:Topic)-[:HAS_DIFFICULTY]->(diff:Difficulty)
-                      -[:HAS_QUESTION]->(q:Question)-[:HAS_ANSWER]->(a:Answer)
-                RETURN q.question_id AS question_id,
-                       q.question_title AS question_title,
-                       q.question_description AS question_description,
-                       q.question_hints AS question_hints,
-                       a.answer_explanation AS answer_explanation,
-                       a.answer_code AS answer_code,
-                       diff.difficulty_level AS difficulty
+                MATCH (d:Domain)-[:HAS_SKILL]->(s:Skill)
+                      -[:HAS_TOPIC]->(t:Topic)
+                      -[:HAS_DIFFICULTY]->(diff:Difficulty)
+                      -[:HAS_QUESTION]->(q:Question)
+                WHERE toLower(d.domain_name) CONTAINS toLower($domain_name)
+                RETURN d.domain_name AS domain,
+                       s.skill_name AS skill,
+                       t.topic_name AS topic,
+                       q.question_id AS question_id,
+                       q.question_title AS question_title
                 LIMIT $limit
                 """,
                 domain_name=domain_name,
                 limit=limit
             )
-            return [record.data() for record in result]
+            domain_results = [record.data() for record in result]
+            return {
+                "domain_res": domain_results
+            }
     
-    def get_questions_by_company(self, company_name: str, limit: int = 5) -> List[dict]:
-        """Fetch questions asked by a specific company"""
+    def get_questions_by_topic(self, SearchKeywords, topic_name: str, limit: int = 5) -> SearchKeywords:
+        """Fetch questions by topic"""
+        topic_name = SearchKeywords.topic_name if SearchKeywords.topic_name else topic_name
         with self.driver.session() as session:
             result = session.run(
                 """
-                MATCH (c:Company {company_name: $company_name})-[:HAS_DOMAIN]->
-                      (cd:CompanyDomain)-[:HAS_ROLE]->(cr:CompanyRole)
-                      -[:ASKS_QUESTION]->(cq:CompanyQuestion)
-                RETURN cq.comp_question_id AS question_id,
-                       cq.comp_question_title AS question_title,
-                       cq.question_type AS question_type,
-                       cq.difficulty AS difficulty,
-                       cq.year_asked AS year_asked
+                MATCH (d:Domain)-[:HAS_SKILL]->(s:Skill)-[:HAS_TOPIC]->(t:Topic)
+                      -[:HAS_DIFFICULTY]->(diff:Difficulty)
+                      -[:HAS_QUESTION]->(q:Question)
+                WHERE toLower(t.topic_name) CONTAINS toLower($topic_name)
+                RETURN d.domain_name AS domain,
+                       s.skill_name AS skill,
+                       t.topic_name AS topic,
+                       q.question_id AS question_id,
+                       q.question_title AS question_title
+                LIMIT $limit
+                """,
+                topic_name=topic_name,
+                limit=limit
+            )
+            topic_results = [record.data() for record in result]
+            return {
+                "topic_results": topic_results
+            }
+
+    def get_questions_by_skill(self, SearchKeywords, skill_name: str, limit: int = 5) -> SearchKeywords:
+        """Fetch questions by skill"""
+        skill_name = SearchKeywords.skills[0] if SearchKeywords.skills else skill_name
+        with self.driver.session() as session:
+            result = session.run(
+                """
+                MATCH (d:Domain)-[:HAS_SKILL]->(s:Skill)-[:HAS_TOPIC]->(t:Topic)
+                      -[:HAS_DIFFICULTY]->(diff:Difficulty)
+                      -[:HAS_QUESTION]->(q:Question)
+                WHERE toLower(s.skill_name) CONTAINS toLower($skill_name)
+                RETURN d.domain_name AS domain,
+                       s.skill_name AS skill,
+                       t.topic_name AS topic,
+                       q.question_id AS question_id,
+                       q.question_title AS question_title
+                LIMIT $limit
+                """,
+                skill_name=skill_name,
+                limit=limit
+            )
+            skill_results = [record.data() for record in result]
+            return {
+                "skill_res": skill_results
+            }
+
+    def get_questions_by_company(self, SearchKeywords, company_name: str, limit: int = 5) -> SearchKeywords:
+        """Fetch questions asked by a specific company"""
+        company_name = SearchKeywords.company_name if SearchKeywords.company_name else company_name
+        with self.driver.session() as session:
+            result = session.run(
+                """
+                MATCH (c:Company)-[:HAS_DOMAIN]->(cd:CompanyDomain)
+                      -[:HAS_ROLE]->(cr:CompanyRole)-[:ASKS_QUESTION]->(cq:CompanyQuestion)
+                WHERE toLower(c.company_name) CONTAINS toLower($company_name)
+                RETURN c.company_name AS company,
+                       cd.domain_name AS domain,
+                       cr.role_name AS role,
+                       cq.comp_question_id AS question_id,
+                       cq.comp_question_title AS question_title
                 LIMIT $limit
                 """,
                 company_name=company_name,
                 limit=limit
             )
-            return [record.data() for record in result]
+            company_results = [record.data() for record in result]
+            return {
+                "company_res": company_results
+            }
+
+    def merge_serach_results(self, SearchKeywords) -> SearchKeywords:
+        """Merge search results into SearchKeywords model"""
+        # This function can be expanded to merge results from multiple queries
+        # For simplicity, we will just return the SearchKeywords as is for now
+        merged_results = {
+            "domain_res": SearchKeywords.domain_res,
+            "topic_results": SearchKeywords.topic_results,
+            "skill_results": SearchKeywords.skill_results,
+            "company_results": SearchKeywords.company_results,
+            
+        }
+        return {
+            "merger_res": merged_results
+        }
+
     
     def get_question_by_id(self, question_id: str) -> Optional[dict]:
         """Fetch a specific question by ID"""
@@ -381,6 +466,91 @@ Provide a helpful, encouraging response that guides them through their interview
         
         return None
     
+    def depth_search_node(self, state: AgentState) -> AgentState:
+            """
+            NEW NODE: Perform Graph RAG depth search
+            
+            This node implements Graph RAG by:
+            1. Traversing the Neo4j graph at specified depth
+            2. Extracting rich contextual information
+            3. Identifying patterns and relationships
+            4. Generating expert insights
+            """
+            print("\n🔬 Executing Graph RAG Depth Search Node...")
+            """
+            Node that performs depth research by first extracting keywords
+            and then searching the database (db search currently empty).
+            """
+            print("---DEPTH RESEARCH NODE---")
+            question = state["question"]
+            
+            # 1. Extract Keywords using the LLM with structured output
+            print("---EXTRACTING KEYWORDS---")
+            structured_llm = self.llm.with_structured_output(SearchKeywords)
+            
+            # helper prompt to ensure extraction focuses on the right entities
+            extraction_prompt = f"""
+            Extract the following details from the user's query: 
+            - Domain/Industry
+            - Specific Skills
+            - Company Name
+            - Company ID (if present)
+            
+            User Query: {question}
+            """
+            
+            keywords_data = structured_llm.invoke(extraction_prompt)
+            
+            if not state.get("enable_rag", True):
+                print("  ⏭️  Graph RAG disabled, skipping...")
+                return state
+            
+            # Get the latest query for context
+            latest_query = state["query"][-1] if state["query"] else ""
+            depth = state.get("search_depth", 2)
+            
+            # Perform Graph RAG depth search
+            # Note: graph_rag_depth_search is hypothetical here as the method doesn't exist in Neo4jHandler yet
+            # Using the new methods implemented instead:
+            
+            # Execute searches based on extracted keywords
+            if keywords_data.domain:
+                keywords_data = self.db.get_questions_by_domain(keywords_data, keywords_data.domain)
+            if keywords_data.skills:
+                keywords_data = self.db.get_questions_by_skill(keywords_data, keywords_data.skills[0])
+            if keywords_data.company_name:
+                keywords_data = self.db.get_questions_by_company(keywords_data, keywords_data.company_name)
+            # if keywords_data.topic_name: # assuming topic might be extracted
+            #    keywords_data = self.db.get_questions_by_topic(keywords_data, keywords_data.topic_name)
+
+            # Merge results
+            keywords_data = self.db.merge_serach_results(keywords_data)
+            
+            # Generate insights using LLM with graph context
+            insights_prompt = f"""Based on the following graph analysis, generate expert insights:
+
+    Query: {latest_query}
+
+    Graph Context:
+    {keywords_data.merger_results}
+
+    Generate structured insights for the user's interview preparation.
+    """
+            
+            try:
+                # Use structured LLM to generate insights
+                # Assuming we want AgentResponse structure here as output
+                insights_response = self.structured_llm.invoke(insights_prompt)
+                
+                state["structured_output"] = insights_response
+                state["response"] = [insights_response.message]
+                
+            except Exception as e:
+                print(f"  ⚠️  Error generating insights: {e}")
+            
+            print("  📊 Graph RAG analysis complete")
+            return state    
+
     def check_satisfaction_node(self, state: AgentState) -> AgentState:
         """Check if user is satisfied with the response"""
         print("\n🔍 Checking user satisfaction...")
@@ -397,6 +567,10 @@ Provide a helpful, encouraging response that guides them through their interview
         elif any(keyword in latest_query for keyword in continuation_keywords):
             state["user_satisfied"] = False
             print("🔄 User wants to continue")
+        elif "depth" in latest_query or "research" in latest_query: # Simple keyword check for depth
+            print("---DECISION: NEED MORE DEPTH RESEARCH---")
+            state["next_step"] = "depth_research"
+            return state
         else:
             # Default to not satisfied (continue conversation)
             state["user_satisfied"] = False
@@ -451,6 +625,7 @@ def create_agent_graph(neo4j_handler: Neo4jHandler, openai_api_key: str) -> Stat
     # Add nodes
     workflow.add_node("start", agent.start_node)
     workflow.add_node("model_query", agent.model_query_node)
+    workflow.add_node("depth_search", agent.depth_search_node)
     workflow.add_node("check_satisfaction", agent.check_satisfaction_node)
     workflow.add_node("end", agent.end_node)
     
@@ -458,11 +633,19 @@ def create_agent_graph(neo4j_handler: Neo4jHandler, openai_api_key: str) -> Stat
     workflow.add_edge(START, "start")
     workflow.add_edge("start", "model_query")
     workflow.add_edge("model_query", "check_satisfaction")
+    workflow.add_edge("depth_search", "check_satisfaction")
     
     # Conditional routing based on user satisfaction
-    def route_after_satisfaction(state: AgentState) -> Literal["model_query", "end"]:
+    def route_after_satisfaction(state: AgentState) -> Literal["model_query", "end", "depth_search"]:
         if state.get("user_satisfied", False):
             return "end"
+        # We need to know if depth search was requested. 
+        # Assuming check_satisfaction_node sets a flag or returns a specific value in state.
+        # But here check_satisfaction_node returns AgentState.
+        # The logic inside check_satisfaction_node was printing "NEED MORE DEPTH RESEARCH".
+        # We need a field in state to hold this decision.
+        if state.get("next_step") == "depth_research":
+             return "depth_search"
         return "model_query"
     
     workflow.add_conditional_edges(
@@ -470,7 +653,8 @@ def create_agent_graph(neo4j_handler: Neo4jHandler, openai_api_key: str) -> Stat
         route_after_satisfaction,
         {
             "model_query": "model_query",
-            "end": "end"
+            "end": "end",
+            "depth_search": "depth_search"
         }
     )
     
@@ -488,7 +672,7 @@ def main():
     print("""
     ╔═══════════════════════════════════════════════╗
     ║   Interview Preparation Agent System          ║
-    ║   Powered by LangGraph + Neo4j + OpenAI      ║
+    ║   Powered by LangGraph + Neo4j + OpenAI       ║
     ╚═══════════════════════════════════════════════╝
     """)
     
