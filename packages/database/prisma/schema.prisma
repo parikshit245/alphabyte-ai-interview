@@ -1,0 +1,169 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mongodb"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  CANDIDATE
+  RECRUITER
+  ADMIN
+  SUPER_ADMIN
+}
+
+enum JobStatus {
+  OPEN
+  CLOSED
+}
+
+enum TemplateType {
+  MOCK
+  REAL
+}
+
+enum QuestionType {
+  TEXT
+  CODING
+}
+
+enum SessionStatus {
+  CREATED
+  IN_PROGRESS
+  COMPLETED
+}
+
+model User {
+  id        String   @id @default(auto()) @map("_id") @db.ObjectId
+  email     String   @unique
+  password  String
+  role      Role     @default(CANDIDATE)
+  firstName String
+  lastName  String
+  companyId String?  @db.ObjectId
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  company            Company?             @relation(fields: [companyId], references: [id], onDelete: SetNull)
+  resumes            Resume[]
+  sessions           InterviewSession[]   @relation("CandidateSessions")
+  createdJobs        Job[]                @relation("RecruiterJobs")
+  createdTemplates   InterviewTemplate[]  @relation("TemplateCreator")
+
+  @@index([companyId])
+  @@index([role])
+}
+
+model Company {
+  id        String   @id @default(auto()) @map("_id") @db.ObjectId
+  name      String
+  domain    String   @unique
+  plan      String   @default("free")
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  users User[]
+}
+
+model Resume {
+  id          String   @id @default(auto()) @map("_id") @db.ObjectId
+  userId      String   @db.ObjectId
+  fileName    String
+  fileUrl     String
+  rawText     String?
+  parsedData  Json     @default("{}")
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  user     User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  sessions InterviewSession[]
+
+  @@index([userId])
+}
+
+model Job {
+  id          String    @id @default(auto()) @map("_id") @db.ObjectId
+  recruiterId String    @db.ObjectId
+  title       String
+  description String
+  status      JobStatus @default(OPEN)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  recruiter User                @relation("RecruiterJobs", fields: [recruiterId], references: [id], onDelete: Cascade)
+  templates InterviewTemplate[]
+
+  @@index([recruiterId])
+}
+
+model InterviewTemplate {
+  id          String       @id @default(auto()) @map("_id") @db.ObjectId
+  jobId       String?      @db.ObjectId
+  type        TemplateType @default(REAL)
+  title       String?
+  createdById String       @db.ObjectId
+  createdAt   DateTime     @default(now())
+
+  job       Job?                @relation(fields: [jobId], references: [id], onDelete: SetNull)
+  creator   User                @relation("TemplateCreator", fields: [createdById], references: [id])
+  questions InterviewQuestion[]
+  sessions  InterviewSession[]
+
+  @@index([jobId])
+}
+
+model InterviewQuestion {
+  id           String       @id @default(auto()) @map("_id") @db.ObjectId
+  templateId   String       @db.ObjectId
+  questionText String
+  order        Int
+  type         QuestionType @default(TEXT)
+  createdAt    DateTime     @default(now())
+
+  template InterviewTemplate @relation(fields: [templateId], references: [id], onDelete: Cascade)
+  answers  InterviewAnswer[]
+
+  @@index([templateId])
+}
+
+model InterviewSession {
+  id          String        @id @default(auto()) @map("_id") @db.ObjectId
+  templateId  String        @db.ObjectId
+  candidateId String        @db.ObjectId
+  resumeId    String?       @db.ObjectId
+  status      SessionStatus @default(CREATED)
+  startedAt   DateTime?
+  completedAt DateTime?
+  createdAt   DateTime      @default(now())
+
+  template  InterviewTemplate @relation(fields: [templateId], references: [id], onDelete: Cascade)
+  candidate User              @relation("CandidateSessions", fields: [candidateId], references: [id], onDelete: Cascade)
+  resume    Resume?           @relation(fields: [resumeId], references: [id])
+  answers   InterviewAnswer[]
+
+  @@index([candidateId])
+  @@index([templateId])
+}
+
+model InterviewAnswer {
+  id         String   @id @default(auto()) @map("_id") @db.ObjectId
+  sessionId  String   @db.ObjectId
+  questionId String   @db.ObjectId
+  answerText String
+  score      Float?
+  feedback   String?
+  createdAt  DateTime @default(now())
+
+  session  InterviewSession  @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  question InterviewQuestion @relation(fields: [questionId], references: [id], onDelete: Cascade)
+
+  @@index([sessionId])
+  @@index([questionId])
+}

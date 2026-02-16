@@ -1,0 +1,85 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        APP_NAME: backend
+    container_name: interview-platform-backend
+    ports:
+      - "3003:3000"
+    volumes:
+      - uploads_data:/app/uploads
+    environment:
+      - NODE_ENV=production
+      - DATABASE_URL=mongodb+srv://parikshitrajpurohit56_db_user:9gAtCytbK2GAsYYE@cluster0.y6oehhr.mongodb.net/ai-interview?retryWrites=true&w=majority&appName=Cluster0
+      - JWT_SECRET=your-super-secret-jwt-key-change-in-production-min-32-chars
+      - JWT_REFRESH_SECRET=your-super-secret-refresh-jwt-key-change-in-production-min-32-chars
+      - AWS_ACCESS_KEY_ID=AKIATHHFLMSMD5OW2H3U
+      - AWS_SECRET_ACCESS_KEY=yNDhRBGV8Hbssg9Hz+kWZ88eaSevPxGUyeZ0gkDF
+      - AWS_BUCKET_NAME=ai-interview-platform
+      - AWS_REGION=ap-south-1
+    networks:
+      - interview-platform-network
+    restart: unless-stopped
+
+  candidate-portal:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        APP_NAME: candidate-portal
+    container_name: interview-platform-candidate
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - NEXT_PUBLIC_API_URL=http://localhost:3003
+    depends_on:
+      - backend
+    networks:
+      - interview-platform-network
+    restart: unless-stopped
+
+  recruiter-portal:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        APP_NAME: recruiter-portal
+    container_name: interview-platform-recruiter
+    ports:
+      - "3001:3000"
+    environment:
+      - NODE_ENV=production
+      - NEXT_PUBLIC_API_URL=http://localhost:3003
+    depends_on:
+      - backend
+    networks:
+      - interview-platform-network
+    restart: unless-stopped
+
+  admin-portal:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        APP_NAME: admin-portal
+    container_name: interview-platform-admin
+    ports:
+      - "3002:3000"
+    environment:
+      - NODE_ENV=production
+      - NEXT_PUBLIC_API_URL=http://localhost:3003
+    depends_on:
+      - backend
+    networks:
+      - interview-platform-network
+    restart: unless-stopped
+
+volumes:
+  uploads_data:
+
+networks:
+  interview-platform-network:
+    driver: bridge
