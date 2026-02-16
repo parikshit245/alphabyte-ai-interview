@@ -51,12 +51,12 @@ def test_chatbot():
         
         config = {"configurable": {"thread_id": thread_id}}
         
-        # Define test inputs
+        # Define test inputs (updated to match actual DB content)
         test_inputs = [
-            "Give me Google Python questions",
-            "I want to practice algorithms questions",
-            "What is the time complexity of QuickSort?", # Answering/Asking
-            "depth research on system design for Netflix",
+            "Give me Google JavaScript questions",
+            "I want to practice Array sorting questions",
+            "What is a closure?",
+            "Show me React interview questions",
             "Thanks, exit"
         ]
 

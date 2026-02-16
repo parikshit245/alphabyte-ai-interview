@@ -267,7 +267,7 @@ class InterviewPrepAgent:
         self.llm = ChatGoogleGenerativeAI(
             model="gemini-2.0-flash-lite",
             temperature=0.7,
-            google_api_key="AIzaSyAdP3smeYdxjo5onXFktwm6oB3o4hLuag4"
+            google_api_key="AIzaSyAzDzUszej5r5P1x9otziVdhz1Xt8kEaU0"
 
         )
     

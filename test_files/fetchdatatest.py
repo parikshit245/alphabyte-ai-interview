@@ -54,25 +54,25 @@ def test_database_connection():
         # Test 1: Check database nodes count
         print_section("📊 DATABASE OVERVIEW")
         with db.driver.session() as session:
-            # Count all nodes by label
-            result = session.run("""
-                CALL db.labels() YIELD label
-                CALL apoc.cypher.run('MATCH (n:' + label + ') RETURN count(n) as count', {})
-                YIELD value
-                RETURN label, value.count as count
-                ORDER BY count DESC
-            """)
             try:
+                # Try using APOC first (if available)
+                result = session.run("""
+                    CALL db.labels() YIELD label
+                    CALL apoc.cypher.run('MATCH (n:' + label + ') RETURN count(n) as count', {})
+                    YIELD value
+                    RETURN label, value.count as count
+                    ORDER BY count DESC
+                """)
                 labels = [{"Label": record["label"], "Count": record["count"]} for record in result]
                 if labels:
                     print("  Node counts by label:")
                     for item in labels:
                         print(f"    - {item['Label']}: {item['Count']} nodes")
                 else:
-                    print("  Using alternative count method...")
-            except:
+                    print("  ⚠️  Database appears to be empty!")
+            except Exception as e:
                 # Fallback if APOC is not available
-                print("  Counting nodes (basic method)...")
+                print("  Counting nodes (APOC not available, using basic method)...")
                 node_counts = {}
                 for label in ["Domain", "Skill", "Topic", "Question", "Answer", "Difficulty", 
                              "Company", "CompanyDomain", "CompanyRole", "CompanyQuestion", "Recruiter"]:
