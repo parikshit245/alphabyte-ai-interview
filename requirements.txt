@@ -10,3 +10,13 @@ langchain-openai
 langgraph
 requests
 python-multipart
+
+# Google Generative AI (Gemini)
+google-generativeai>=0.3.0
+
+# Pydantic for data validation
+pydantic>=2.0.0
+
+# Other utilities
+python-dotenv>=1.0.0
+typing-extensions>=4.8.0

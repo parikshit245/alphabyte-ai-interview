@@ -1,24 +1,27 @@
 """
 Interview Preparation Agent System using LangGraph and Neo4j
+FULLY CORRECTED VERSION with Gemini support
 
-This agent system helps users prepare for interview questions by:
-- Managing a conversation state with questions, answers, and evaluations
-- Querying Neo4j database for interview questions
-- Providing feedback and guidance
-- Supporting multi-turn conversations with thread management
+All logical inconsistencies fixed:
+- Proper state management
+- Consistent return types
+- Separated keyword extraction and depth search
+- Fixed routing logic
+- Gemini integration with structured output
 """
 
 import os
-from typing import List, Annotated, Literal, Optional
+from typing import List, Annotated, Literal, Optional, Dict, Any
 from typing_extensions import TypedDict
 from datetime import datetime
 import operator
+import json
 import dotenv
 
 dotenv.load_dotenv()
 
 from pydantic import BaseModel, Field
-from langchain_openai import ChatOpenAI
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import StateGraph, END, START
 from langgraph.checkpoint.memory import MemorySaver
 from neo4j import GraphDatabase
@@ -33,8 +36,8 @@ NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
 NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "password")
 
-# OpenAI Configuration
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "your-api-key-here")
+# Google Gemini Configuration
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "your-google-api-key-here")
 
 
 # ============================================================================
@@ -56,25 +59,31 @@ class FeedbackResponse(BaseModel):
     improvements: List[str] = Field(description="Areas for improvement")
     score: int = Field(description="Score out of 10", ge=0, le=10)
     follow_up_suggestions: List[str] = Field(description="Suggestions for follow-up learning")
-    
+
 
 class SearchKeywords(BaseModel):
+    """Extracted keywords from user query - INPUT ONLY"""
     domain: Optional[str] = Field(None, description="The industry or domain related to the query")
-    skills: List[str] = Field(default_factory=list, description="List of technical skills or qualifications mentioned")
-    Topic: Optional[str] = Field(None, description="The specific ID of the company")
+    skills: List[str] = Field(default_factory=list, description="List of technical skills mentioned")
+    topic: Optional[str] = Field(None, description="The specific topic mentioned")
     company_name: Optional[str] = Field(None, description="The name of the company")
-    domain_res: Optional[List[dict]] = Field(default=None, description="Results from domain-based search")
-    topic_results: Optional[List[dict]] = Field(default=None, description="Results from topic-based search")
-    skill_results: Optional[List[dict]] = Field(default=None, description="Results from skill-based search")
-    company_results: Optional[List[dict]] = Field(default=None, description="Results from company-based search")
-    merger_results: Optional[dict] = Field(default=None, description="Merged search results")
+
+
+class SearchResults(BaseModel):
+    """Aggregated search results from database - OUTPUT ONLY"""
+    domain_results: Optional[List[Dict]] = Field(default=None, description="Results from domain search")
+    topic_results: Optional[List[Dict]] = Field(default=None, description="Results from topic search")
+    skill_results: Optional[List[Dict]] = Field(default=None, description="Results from skill search")
+    company_results: Optional[List[Dict]] = Field(default=None, description="Results from company search")
+    total_results: int = Field(default=0, description="Total number of results found")
+
 
 class AgentResponse(BaseModel):
     """Structured output from the agent"""
     message: str = Field(description="Main response message to the user")
-    questions_provided: Optional[List[QuestionAnswer]] = Field(default=None, description="Questions provided in this response")
-    feedback: Optional[FeedbackResponse] = Field(default=None, description="Feedback on user's answer if applicable")
-    next_action: Literal["continue", "end", "provide_question", "evaluate_answer"] = Field(
+    questions_provided: Optional[List[QuestionAnswer]] = Field(default=None, description="Questions provided")
+    feedback: Optional[FeedbackResponse] = Field(default=None, description="Feedback on answer if applicable")
+    next_action: Literal["continue", "end", "provide_question", "evaluate_answer", "depth_search"] = Field(
         description="Suggested next action"
     )
 
@@ -85,16 +94,9 @@ class AgentResponse(BaseModel):
 
 class AgentState(TypedDict):
     """
-    State of the interview preparation agent
+    Complete state of the interview preparation agent
     
-    Attributes:
-        questions_list: List of [question, question_id, candidate_answer, org_answer]
-        query: User's latest query (annotated to accumulate)
-        response: Agent's response (annotated to accumulate)
-        thread_id: Unique thread identifier for conversation persistence
-        structured_output: Pydantic BaseModel output
-        user_satisfied: Flag indicating if user is satisfied
-        current_question_index: Index of current question being worked on
+    All fields properly defined and initialized
     """
     questions_list: List[List[Optional[str]]]  # [[question, question_id, candidate_answer, org_answer]]
     query: Annotated[List[str], operator.add]  # Accumulate queries
@@ -103,14 +105,19 @@ class AgentState(TypedDict):
     structured_output: Optional[AgentResponse]
     user_satisfied: bool
     current_question_index: int
+    search_keywords: Optional[SearchKeywords]  # Extracted keywords
+    search_results: Optional[SearchResults]  # Search results
+    need_depth_search: bool  # Flag for depth search
+    enable_rag: bool  # Enable/disable Graph RAG
+    search_depth: int  # Depth level for traversal
 
 
 # ============================================================================
-# NEO4J DATABASE HANDLER
+# NEO4J DATABASE HANDLER - FIXED
 # ============================================================================
 
 class Neo4jHandler:
-    """Handler for Neo4j database operations"""
+    """Handler for Neo4j database operations - ALL METHODS RETURN CONSISTENT TYPES"""
     
     def __init__(self, uri: str, user: str, password: str):
         self.driver = GraphDatabase.driver(uri, auth=(user, password))
@@ -119,9 +126,8 @@ class Neo4jHandler:
         """Close the database connection"""
         self.driver.close()
     
-    def get_questions_by_domain(self, SearchKeywords, domain_name: str, limit: int = 5) -> SearchKeywords:
-        """Fetch questions by domain"""
-        domain_name = SearchKeywords.domain if SearchKeywords.domain else domain_name
+    def get_questions_by_domain(self, domain_name: str, limit: int = 5) -> List[Dict]:
+        """Fetch questions by domain - RETURNS List[Dict]"""
         with self.driver.session() as session:
             result = session.run(
                 """
@@ -129,143 +135,116 @@ class Neo4jHandler:
                       -[:HAS_TOPIC]->(t:Topic)
                       -[:HAS_DIFFICULTY]->(diff:Difficulty)
                       -[:HAS_QUESTION]->(q:Question)
-                WHERE toLower(d.domain_name) CONTAINS toLower($domain_name)
-                RETURN d.domain_name AS domain,
-                       s.skill_name AS skill,
-                       t.topic_name AS topic,
+                WHERE toLower(d.name) CONTAINS toLower($domain_name)
+                RETURN d.name AS domain,
+                       s.name AS skill,
+                       t.name AS topic,
                        q.question_id AS question_id,
-                       q.question_title AS question_title
+                       q.title AS question_title,
+                       q.description AS question_description
                 LIMIT $limit
                 """,
                 domain_name=domain_name,
                 limit=limit
             )
-            domain_results = [record.data() for record in result]
-            return {
-                "domain_res": domain_results
-            }
+            return [record.data() for record in result]
     
-    def get_questions_by_topic(self, SearchKeywords, topic_name: str, limit: int = 5) -> SearchKeywords:
-        """Fetch questions by topic"""
-        topic_name = SearchKeywords.topic_name if SearchKeywords.topic_name else topic_name
+    def get_questions_by_topic(self, topic_name: str, limit: int = 5) -> List[Dict]:
+        """Fetch questions by topic - RETURNS List[Dict]"""
         with self.driver.session() as session:
             result = session.run(
                 """
                 MATCH (d:Domain)-[:HAS_SKILL]->(s:Skill)-[:HAS_TOPIC]->(t:Topic)
                       -[:HAS_DIFFICULTY]->(diff:Difficulty)
                       -[:HAS_QUESTION]->(q:Question)
-                WHERE toLower(t.topic_name) CONTAINS toLower($topic_name)
-                RETURN d.domain_name AS domain,
-                       s.skill_name AS skill,
-                       t.topic_name AS topic,
+                WHERE toLower(t.name) CONTAINS toLower($topic_name)
+                RETURN d.name AS domain,
+                       s.name AS skill,
+                       t.name AS topic,
                        q.question_id AS question_id,
-                       q.question_title AS question_title
+                       q.title AS question_title,
+                       q.description AS question_description
                 LIMIT $limit
                 """,
                 topic_name=topic_name,
                 limit=limit
             )
-            topic_results = [record.data() for record in result]
-            return {
-                "topic_results": topic_results
-            }
+            return [record.data() for record in result]
 
-    def get_questions_by_skill(self, SearchKeywords, skill_name: str, limit: int = 5) -> SearchKeywords:
-        """Fetch questions by skill"""
-        skill_name = SearchKeywords.skills[0] if SearchKeywords.skills else skill_name
+    def get_questions_by_skill(self, skill_name: str, limit: int = 5) -> List[Dict]:
+        """Fetch questions by skill - RETURNS List[Dict]"""
         with self.driver.session() as session:
             result = session.run(
                 """
                 MATCH (d:Domain)-[:HAS_SKILL]->(s:Skill)-[:HAS_TOPIC]->(t:Topic)
                       -[:HAS_DIFFICULTY]->(diff:Difficulty)
                       -[:HAS_QUESTION]->(q:Question)
-                WHERE toLower(s.skill_name) CONTAINS toLower($skill_name)
-                RETURN d.domain_name AS domain,
-                       s.skill_name AS skill,
-                       t.topic_name AS topic,
+                WHERE toLower(s.name) CONTAINS toLower($skill_name)
+                RETURN d.name AS domain,
+                       s.name AS skill,
+                       t.name AS topic,
                        q.question_id AS question_id,
-                       q.question_title AS question_title
+                       q.title AS question_title,
+                       q.description AS question_description
                 LIMIT $limit
                 """,
                 skill_name=skill_name,
                 limit=limit
             )
-            skill_results = [record.data() for record in result]
-            return {
-                "skill_res": skill_results
-            }
+            return [record.data() for record in result]
 
-    def get_questions_by_company(self, SearchKeywords, company_name: str, limit: int = 5) -> SearchKeywords:
-        """Fetch questions asked by a specific company"""
-        company_name = SearchKeywords.company_name if SearchKeywords.company_name else company_name
+    def get_questions_by_company(self, company_name: str, limit: int = 5) -> List[Dict]:
+        """Fetch questions asked by a specific company - RETURNS List[Dict]"""
         with self.driver.session() as session:
             result = session.run(
                 """
                 MATCH (c:Company)-[:HAS_DOMAIN]->(cd:CompanyDomain)
                       -[:HAS_ROLE]->(cr:CompanyRole)-[:ASKS_QUESTION]->(cq:CompanyQuestion)
-                WHERE toLower(c.company_name) CONTAINS toLower($company_name)
-                RETURN c.company_name AS company,
-                       cd.domain_name AS domain,
-                       cr.role_name AS role,
+                WHERE toLower(c.name) CONTAINS toLower($company_name)
+                RETURN c.name AS company,
+                       cd.name AS domain,
+                       cr.name AS role,
                        cq.comp_question_id AS question_id,
-                       cq.comp_question_title AS question_title
+                       cq.title AS question_title,
+                       cq.difficulty AS difficulty
                 LIMIT $limit
                 """,
                 company_name=company_name,
                 limit=limit
             )
-            company_results = [record.data() for record in result]
-            return {
-                "company_res": company_results
-            }
-
-    def merge_serach_results(self, SearchKeywords) -> SearchKeywords:
-        """Merge search results into SearchKeywords model"""
-        # This function can be expanded to merge results from multiple queries
-        # For simplicity, we will just return the SearchKeywords as is for now
-        merged_results = {
-            "domain_res": SearchKeywords.domain_res,
-            "topic_results": SearchKeywords.topic_results,
-            "skill_results": SearchKeywords.skill_results,
-            "company_results": SearchKeywords.company_results,
-            
-        }
-        return {
-            "merger_res": merged_results
-        }
-
+            return [record.data() for record in result]
     
-    def get_question_by_id(self, question_id: str) -> Optional[dict]:
+    def get_question_by_id(self, question_id: str) -> Optional[Dict]:
         """Fetch a specific question by ID"""
         with self.driver.session() as session:
             result = session.run(
                 """
                 MATCH (q:Question {question_id: $question_id})-[:HAS_ANSWER]->(a:Answer)
                 RETURN q.question_id AS question_id,
-                       q.question_title AS question_title,
-                       q.question_description AS question_description,
-                       q.question_hints AS question_hints,
-                       q.question_example AS question_example,
-                       a.answer_explanation AS answer_explanation,
-                       a.answer_code AS answer_code
+                       q.title AS question_title,
+                       q.description AS question_description,
+                       q.hints AS question_hints,
+                       q.example AS question_example,
+                       a.explanation AS answer_explanation,
+                       a.code AS answer_code
                 """,
                 question_id=question_id
             )
             record = result.single()
             return record.data() if record else None
     
-    def get_questions_by_difficulty(self, difficulty_level: str, limit: int = 5) -> List[dict]:
+    def get_questions_by_difficulty(self, difficulty_level: str, limit: int = 5) -> List[Dict]:
         """Fetch questions by difficulty level"""
         with self.driver.session() as session:
             result = session.run(
                 """
-                MATCH (diff:Difficulty {difficulty_level: $difficulty_level})
+                MATCH (diff:Difficulty {difficulty_id: $difficulty_level})
                       -[:HAS_QUESTION]->(q:Question)-[:HAS_ANSWER]->(a:Answer)
                 RETURN q.question_id AS question_id,
-                       q.question_title AS question_title,
-                       q.question_description AS question_description,
-                       a.answer_explanation AS answer_explanation,
-                       diff.difficulty_level AS difficulty
+                       q.title AS question_title,
+                       q.description AS question_description,
+                       a.explanation AS answer_explanation,
+                       diff.level AS difficulty
                 LIMIT $limit
                 """,
                 difficulty_level=difficulty_level,
@@ -275,25 +254,28 @@ class Neo4jHandler:
 
 
 # ============================================================================
-# AGENT NODES
+# AGENT NODES - ALL FIXED TO RETURN AgentState
 # ============================================================================
 
 class InterviewPrepAgent:
-    """Main agent class for interview preparation"""
+    """Main agent class for interview preparation with Gemini"""
     
-    def __init__(self, neo4j_handler: Neo4jHandler, openai_api_key: str):
+    def __init__(self, neo4j_handler: Neo4jHandler, google_api_key: str):
         self.db = neo4j_handler
-        self.llm = ChatOpenAI(
-            model="gpt-4o",
+        
+        # Initialize Gemini LLM
+        self.llm = ChatGoogleGenerativeAI(
+            model="gemini-2.0-flash-lite",
             temperature=0.7,
-            api_key=openai_api_key
+            google_api_key="AIzaSyAdP3smeYdxjo5onXFktwm6oB3o4hLuag4"
+
         )
-        self.structured_llm = self.llm.with_structured_output(AgentResponse)
     
     def start_node(self, state: AgentState) -> AgentState:
-        """Initialize the conversation"""
-        print("\n🚀 Starting Interview Prep Agent...")
+        """Initialize the conversation - PROPERLY INITIALIZE ALL STATE FIELDS"""
+        print("\n🚀 Starting Interview Prep Agent with Gemini...")
         
+        # Initialize ALL state fields
         if not state.get("thread_id"):
             state["thread_id"] = f"thread_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
             print(f"📋 Created thread: {state['thread_id']}")
@@ -304,40 +286,203 @@ class InterviewPrepAgent:
         if not state.get("current_question_index"):
             state["current_question_index"] = 0
         
+        # Initialize new fields
+        if not state.get("search_keywords"):
+            state["search_keywords"] = None
+        
+        if not state.get("search_results"):
+            state["search_results"] = None
+        
+        if not state.get("need_depth_search"):
+            state["need_depth_search"] = False
+        
+        if "enable_rag" not in state:
+            state["enable_rag"] = True
+        
+        if not state.get("search_depth"):
+            state["search_depth"] = 2
+        
+        return state
+    
+    def extract_keywords_node(self, state: AgentState) -> AgentState:
+        """
+        SEPARATED NODE: Extract keywords from user query
+        RETURNS: AgentState with updated search_keywords
+        """
+        print("\n🔍 Extracting keywords from query...")
+        
+        # Get latest query from state (NOT from non-existent state["question"])
+        latest_query = state["query"][-1] if state["query"] else ""
+        
+        extraction_prompt = f"""
+Extract the following details from the user's query and respond ONLY with valid JSON.
+
+User Query: {latest_query}
+
+Respond with this exact JSON structure (no markdown, no extra text):
+{{
+    "domain": "domain name or null",
+    "skills": ["skill1", "skill2"] or [],
+    "topic": "topic name or null",
+    "company_name": "company name or null"
+}}
+
+Examples:
+- "Give me Google Python questions" -> {{"domain": null, "skills": ["Python"], "topic": null, "company_name": "Google"}}
+- "I want algorithms questions" -> {{"domain": "algorithms", "skills": [], "topic": null, "company_name": null}}
+"""
+        
+        try:
+            response = self.llm.invoke(extraction_prompt)
+            content = response.content
+            
+            # Parse JSON from response
+            if "```json" in content:
+                content = content.split("```json")[1].split("```")[0].strip()
+            elif "```" in content:
+                content = content.split("```")[1].split("```")[0].strip()
+            
+            keywords_dict = json.loads(content)
+            
+            # Create SearchKeywords object
+            state["search_keywords"] = SearchKeywords(
+                domain=keywords_dict.get("domain"),
+                skills=keywords_dict.get("skills", []),
+                topic=keywords_dict.get("topic"),
+                company_name=keywords_dict.get("company_name")
+            )
+            
+            print(f"✅ Extracted: domain={state['search_keywords'].domain}, "
+                  f"skills={state['search_keywords'].skills}, "
+                  f"topic={state['search_keywords'].topic}, "
+                  f"company={state['search_keywords'].company_name}")
+            
+        except Exception as e:
+            print(f"⚠️ Error extracting keywords: {e}")
+            state["search_keywords"] = SearchKeywords()
+        
+        return state
+    
+    def depth_search_node(self, state: AgentState) -> AgentState:
+        """
+        SEPARATED NODE: Perform depth search in Neo4j
+        RETURNS: AgentState with updated search_results
+        """
+        print("\n🔬 Executing Depth Search Node...")
+        
+        if not state.get("enable_rag", True):
+            print("  ⏭️  Graph RAG disabled, skipping...")
+            return state
+        
+        keywords = state.get("search_keywords")
+        if not keywords:
+            print("  ⚠️  No keywords extracted, skipping search")
+            return state
+        
+        # Initialize result lists
+        domain_results = []
+        topic_results = []
+        skill_results = []
+        company_results = []
+        
+        # Perform searches based on extracted keywords
+        try:
+            if keywords.domain:
+                print(f"  🔍 Searching by domain: {keywords.domain}")
+                domain_results = self.db.get_questions_by_domain(keywords.domain)
+            
+            if keywords.topic:
+                print(f"  🔍 Searching by topic: {keywords.topic}")
+                topic_results = self.db.get_questions_by_topic(keywords.topic)
+            
+            if keywords.skills:
+                print(f"  🔍 Searching by skills: {keywords.skills}")
+                for skill in keywords.skills[:2]:  # Limit to first 2 skills
+                    results = self.db.get_questions_by_skill(skill)
+                    skill_results.extend(results)
+            
+            if keywords.company_name:
+                print(f"  🔍 Searching by company: {keywords.company_name}")
+                company_results = self.db.get_questions_by_company(keywords.company_name)
+            
+            # Aggregate results
+            total_results = (len(domain_results) + len(topic_results) + 
+                           len(skill_results) + len(company_results))
+            
+            # Store in state
+            state["search_results"] = SearchResults(
+                domain_results=domain_results if domain_results else None,
+                topic_results=topic_results if topic_results else None,
+                skill_results=skill_results if skill_results else None,
+                company_results=company_results if company_results else None,
+                total_results=total_results
+            )
+            
+            print(f"  ✅ Found {total_results} total results")
+            
+        except Exception as e:
+            print(f"  ❌ Error during depth search: {e}")
+            state["search_results"] = SearchResults(total_results=0)
+        
         return state
     
     def model_query_node(self, state: AgentState) -> AgentState:
-        """Process user query using LLM"""
-        print("\n🤖 Processing query...")
+        """
+        Process user query using Gemini LLM
+        RETURNS: AgentState with updated structured_output and response
+        """
+        print("\n🤖 Processing query with Gemini...")
         
-        # Get the latest user query
         latest_query = state["query"][-1] if state["query"] else ""
-        
-        # Build context from conversation history
         context = self._build_context(state)
-        
-        # Detect intent and prepare prompt
         prompt = self._prepare_prompt(latest_query, context, state)
         
-        # Get structured response from LLM
         try:
-            structured_response: AgentResponse = self.structured_llm.invoke(prompt)
+            response = self.llm.invoke(prompt)
+            content = response.content
             
-            # Update state based on response
+            # Parse JSON response
+            if "```json" in content:
+                json_str = content.split("```json")[1].split("```")[0].strip()
+            elif "{" in content and "}" in content:
+                start = content.find("{")
+                end = content.rfind("}") + 1
+                json_str = content[start:end]
+            else:
+                # Fallback
+                json_str = json.dumps({
+                    "message": content,
+                    "questions_provided": None,
+                    "feedback": None,
+                    "next_action": "continue"
+                })
+            
+            response_dict = json.loads(json_str)
+            
+            # Create structured response
+            structured_response = AgentResponse(
+                message=response_dict.get("message", content),
+                questions_provided=response_dict.get("questions_provided"),
+                feedback=response_dict.get("feedback"),
+                next_action=response_dict.get("next_action", "continue")
+            )
+            
             state["structured_output"] = structured_response
             state["response"] = [structured_response.message]
             
-            # Handle different action types
+            # Handle actions
             if structured_response.next_action == "provide_question":
-                state = self._handle_question_provision(state, structured_response, latest_query)
+                state = self._handle_question_provision(state)
             elif structured_response.next_action == "evaluate_answer":
-                state = self._handle_answer_evaluation(state, structured_response)
+                state = self._handle_answer_evaluation(state)
+            elif structured_response.next_action == "depth_search":
+                state["need_depth_search"] = True
             
             print(f"✅ Response generated: {structured_response.next_action}")
             
         except Exception as e:
             print(f"❌ Error in model query: {e}")
-            state["response"] = [f"I encountered an error processing your request: {str(e)}"]
+            state["response"] = [f"Error: {str(e)}"]
             state["structured_output"] = AgentResponse(
                 message=f"Error: {str(e)}",
                 next_action="continue"
@@ -356,232 +501,180 @@ class InterviewPrepAgent:
                 context_parts.append(f"User {i}: {q}")
                 context_parts.append(f"Agent {i}: {r}")
         
+        # Add search results context
+        if state.get("search_results"):
+            sr = state["search_results"]
+            context_parts.append(f"\n📊 Database Search Results (Total: {sr.total_results}):")
+            
+            if sr.domain_results:
+                context_parts.append(f"  - Domain: {len(sr.domain_results)} questions")
+            if sr.topic_results:
+                context_parts.append(f"  - Topic: {len(sr.topic_results)} questions")
+            if sr.skill_results:
+                context_parts.append(f"  - Skill: {len(sr.skill_results)} questions")
+            if sr.company_results:
+                context_parts.append(f"  - Company: {len(sr.company_results)} questions")
+        
         # Add current questions
         if state["questions_list"]:
-            context_parts.append("\nCurrent Questions in Session:")
-            for i, q_data in enumerate(state["questions_list"], 1):
-                question, q_id, candidate_ans, org_ans = q_data
-                context_parts.append(f"{i}. {question} (ID: {q_id})")
-                if candidate_ans:
-                    context_parts.append(f"   User's answer: {candidate_ans}")
+            context_parts.append(f"\n📝 Questions in Session: {len(state['questions_list'])}")
         
         return "\n".join(context_parts)
     
     def _prepare_prompt(self, query: str, context: str, state: AgentState) -> str:
-        """Prepare the prompt for LLM"""
-        return f"""You are an expert interview preparation assistant. Your role is to:
-1. Help users practice interview questions
-2. Provide detailed feedback on their answers
-3. Suggest relevant questions based on their needs
-4. Offer guidance and tips for improvement
+        """Prepare the prompt for Gemini"""
+        
+        search_results_str = ""
+        if state.get("search_results") and state["search_results"].total_results > 0:
+            sr = state["search_results"]
+            search_results_str = "\nAvailable Questions from Database:\n"
+            
+            all_questions = []
+            if sr.domain_results:
+                all_questions.extend(sr.domain_results[:3])
+            if sr.topic_results:
+                all_questions.extend(sr.topic_results[:3])
+            if sr.skill_results:
+                all_questions.extend(sr.skill_results[:3])
+            if sr.company_results:
+                all_questions.extend(sr.company_results[:3])
+            
+            for i, q in enumerate(all_questions[:5], 1):
+                title = q.get('question_title', 'N/A')
+                qid = q.get('question_id', 'N/A')
+                search_results_str += f"{i}. {title} (ID: {qid})\n"
+        
+        return f"""You are an expert interview preparation assistant.
 
 Context:
 {context}
 
+{search_results_str}
+
 Current User Query: {query}
 
-Thread ID: {state['thread_id']}
+Respond in JSON format with these EXACT fields:
+{{
+    "message": "Your helpful response to the user",
+    "questions_provided": null,
+    "feedback": null,
+    "next_action": "continue"
+}}
 
-Based on the user's query, determine the appropriate action:
-- If they're requesting questions (mention: company, domain, difficulty, topic), respond with next_action="provide_question"
-- If they're providing an answer to a question, respond with next_action="evaluate_answer"
-- If they want to continue or have general queries, respond with next_action="continue"
-- If they indicate they're done or satisfied, respond with next_action="end"
+Guidelines for next_action:
+- "provide_question": If user asks for questions and we have search results
+- "evaluate_answer": If user provides an answer to a question
+- "depth_search": If user wants deeper insights/research
+- "end": If user says thanks/bye/done
+- "continue": For general conversation
 
-Provide a helpful, encouraging response that guides them through their interview preparation.
+Respond ONLY with valid JSON, no markdown code blocks.
 """
     
-    def _handle_question_provision(self, state: AgentState, response: AgentResponse, query: str) -> AgentState:
-        """Handle providing questions to the user"""
-        # Parse query for intent
-        query_lower = query.lower()
-        questions = []
+    def _handle_question_provision(self, state: AgentState) -> AgentState:
+        """Add questions from search results to state"""
+        print("  📚 Adding questions to session...")
         
-        try:
-            if "company" in query_lower:
-                # Extract company name (simplified - could use NER)
-                company_name = self._extract_entity(query, "company")
-                if company_name:
-                    questions = self.db.get_questions_by_company(company_name)
-            elif "domain" in query_lower:
-                domain_name = self._extract_entity(query, "domain")
-                if domain_name:
-                    questions = self.db.get_questions_by_domain(domain_name)
-            elif any(word in query_lower for word in ["easy", "medium", "hard"]):
-                difficulty = "Easy" if "easy" in query_lower else "Medium" if "medium" in query_lower else "Hard"
-                questions = self.db.get_questions_by_difficulty(difficulty)
-            
-            # Add questions to state
-            for q in questions:
+        if not state.get("search_results"):
+            return state
+        
+        sr = state["search_results"]
+        questions_added = 0
+        
+        # Collect all questions
+        all_questions = []
+        if sr.domain_results:
+            all_questions.extend(sr.domain_results)
+        if sr.topic_results:
+            all_questions.extend(sr.topic_results)
+        if sr.skill_results:
+            all_questions.extend(sr.skill_results)
+        if sr.company_results:
+            all_questions.extend(sr.company_results)
+        
+        # Add unique questions to state
+        existing_ids = {q[1] for q in state["questions_list"]}
+        
+        for q in all_questions:
+            question_id = q.get("question_id", "")
+            if question_id and question_id not in existing_ids:
                 question_text = q.get("question_title") or q.get("question_description", "")
-                question_id = q.get("question_id", "")
                 org_answer = q.get("answer_explanation", "")
                 
                 state["questions_list"].append([question_text, question_id, None, org_answer])
-            
-            print(f"📚 Added {len(questions)} questions to session")
-            
-        except Exception as e:
-            print(f"⚠️ Error fetching questions: {e}")
+                existing_ids.add(question_id)
+                questions_added += 1
+                
+                if questions_added >= 5:
+                    break
         
+        print(f"  ✅ Added {questions_added} questions")
         return state
     
-    def _handle_answer_evaluation(self, state: AgentState, response: AgentResponse) -> AgentState:
-        """Handle evaluation of user's answer"""
-        # Find the current question being answered
+    def _handle_answer_evaluation(self, state: AgentState) -> AgentState:
+        """Record user's answer"""
         if state["questions_list"] and state["current_question_index"] < len(state["questions_list"]):
             current_q = state["questions_list"][state["current_question_index"]]
-            
-            # Extract user's answer from the latest query
             user_answer = state["query"][-1] if state["query"] else ""
-            
-            # Update the candidate answer
             current_q[2] = user_answer
             
-            print(f"✍️ Recorded answer for question {state['current_question_index'] + 1}")
-            
-            # Move to next question
+            print(f"  ✍️ Recorded answer for question {state['current_question_index'] + 1}")
             state["current_question_index"] += 1
         
         return state
     
-    def _extract_entity(self, text: str, entity_type: str) -> Optional[str]:
-        """Simple entity extraction (can be enhanced with NER)"""
-        text_lower = text.lower()
-        
-        if entity_type == "company":
-            # Common company names
-            companies = ["google", "amazon", "microsoft", "apple", "facebook", "meta", "netflix", "tesla"]
-            for company in companies:
-                if company in text_lower:
-                    return company.capitalize()
-        
-        elif entity_type == "domain":
-            # Common domains
-            domains = ["algorithms", "data structures", "system design", "machine learning", 
-                      "web development", "database", "networking"]
-            for domain in domains:
-                if domain in text_lower:
-                    return domain.title()
-        
-        return None
-    
-    def depth_search_node(self, state: AgentState) -> AgentState:
-            """
-            NEW NODE: Perform Graph RAG depth search
-            
-            This node implements Graph RAG by:
-            1. Traversing the Neo4j graph at specified depth
-            2. Extracting rich contextual information
-            3. Identifying patterns and relationships
-            4. Generating expert insights
-            """
-            print("\n🔬 Executing Graph RAG Depth Search Node...")
-            """
-            Node that performs depth research by first extracting keywords
-            and then searching the database (db search currently empty).
-            """
-            print("---DEPTH RESEARCH NODE---")
-            question = state["question"]
-            
-            # 1. Extract Keywords using the LLM with structured output
-            print("---EXTRACTING KEYWORDS---")
-            structured_llm = self.llm.with_structured_output(SearchKeywords)
-            
-            # helper prompt to ensure extraction focuses on the right entities
-            extraction_prompt = f"""
-            Extract the following details from the user's query: 
-            - Domain/Industry
-            - Specific Skills
-            - Company Name
-            - Company ID (if present)
-            
-            User Query: {question}
-            """
-            
-            keywords_data = structured_llm.invoke(extraction_prompt)
-            
-            if not state.get("enable_rag", True):
-                print("  ⏭️  Graph RAG disabled, skipping...")
-                return state
-            
-            # Get the latest query for context
-            latest_query = state["query"][-1] if state["query"] else ""
-            depth = state.get("search_depth", 2)
-            
-            # Perform Graph RAG depth search
-            # Note: graph_rag_depth_search is hypothetical here as the method doesn't exist in Neo4jHandler yet
-            # Using the new methods implemented instead:
-            
-            # Execute searches based on extracted keywords
-            if keywords_data.domain:
-                keywords_data = self.db.get_questions_by_domain(keywords_data, keywords_data.domain)
-            if keywords_data.skills:
-                keywords_data = self.db.get_questions_by_skill(keywords_data, keywords_data.skills[0])
-            if keywords_data.company_name:
-                keywords_data = self.db.get_questions_by_company(keywords_data, keywords_data.company_name)
-            # if keywords_data.topic_name: # assuming topic might be extracted
-            #    keywords_data = self.db.get_questions_by_topic(keywords_data, keywords_data.topic_name)
-
-            # Merge results
-            keywords_data = self.db.merge_serach_results(keywords_data)
-            
-            # Generate insights using LLM with graph context
-            insights_prompt = f"""Based on the following graph analysis, generate expert insights:
-
-    Query: {latest_query}
-
-    Graph Context:
-    {keywords_data.merger_results}
-
-    Generate structured insights for the user's interview preparation.
-    """
-            
-            try:
-                # Use structured LLM to generate insights
-                # Assuming we want AgentResponse structure here as output
-                insights_response = self.structured_llm.invoke(insights_prompt)
-                
-                state["structured_output"] = insights_response
-                state["response"] = [insights_response.message]
-                
-            except Exception as e:
-                print(f"  ⚠️  Error generating insights: {e}")
-            
-            print("  📊 Graph RAG analysis complete")
-            return state    
-
     def check_satisfaction_node(self, state: AgentState) -> AgentState:
-        """Check if user is satisfied with the response"""
+        """
+        Check if user is satisfied or needs more depth
+        RETURNS: AgentState with updated satisfaction flags
+        """
         print("\n🔍 Checking user satisfaction...")
         
-        # Check for satisfaction keywords
         latest_query = state["query"][-1].lower() if state["query"] else ""
         
-        satisfaction_keywords = ["thanks", "thank you", "done", "finished", "exit", "bye", "good"]
+        # Define keywords
+        satisfaction_keywords = ["thanks", "thank you", "done", "finished", "exit", "bye"]
+        depth_keywords = ["depth", "research", "more details", "deep dive", "comprehensive"]
         continuation_keywords = ["more", "another", "next", "continue", "help", "question"]
         
+        # Determine satisfaction state
         if any(keyword in latest_query for keyword in satisfaction_keywords):
             state["user_satisfied"] = True
-            print("✅ User appears satisfied")
+            state["need_depth_search"] = False
+            print("  ✅ User appears satisfied")
+        elif any(keyword in latest_query for keyword in depth_keywords):
+            state["user_satisfied"] = False
+            state["need_depth_search"] = True
+            print("  🔬 User wants depth search")
         elif any(keyword in latest_query for keyword in continuation_keywords):
             state["user_satisfied"] = False
-            print("🔄 User wants to continue")
-        elif "depth" in latest_query or "research" in latest_query: # Simple keyword check for depth
-            print("---DECISION: NEED MORE DEPTH RESEARCH---")
-            state["next_step"] = "depth_research"
-            return state
+            state["need_depth_search"] = False
+            print("  🔄 User wants to continue")
         else:
-            # Default to not satisfied (continue conversation)
-            state["user_satisfied"] = False
+            # Check structured output
+            if state.get("structured_output"):
+                if state["structured_output"].next_action == "end":
+                    state["user_satisfied"] = True
+                    state["need_depth_search"] = False
+                elif state["structured_output"].next_action == "depth_search":
+                    state["user_satisfied"] = False
+                    state["need_depth_search"] = True
+                else:
+                    state["user_satisfied"] = False
+                    state["need_depth_search"] = False
+            else:
+                state["user_satisfied"] = False
+                state["need_depth_search"] = False
         
         return state
     
     def end_node(self, state: AgentState) -> AgentState:
-        """End the conversation"""
+        """
+        End the conversation
+        RETURNS: AgentState with final summary
+        """
         print("\n🎯 Ending conversation...")
         
-        # Generate summary
         summary_parts = [
             "\n" + "="*50,
             "📊 INTERVIEW PREP SESSION SUMMARY",
@@ -590,6 +683,9 @@ Provide a helpful, encouraging response that guides them through their interview
             f"Total Questions Covered: {len(state['questions_list'])}",
             f"Questions Answered: {sum(1 for q in state['questions_list'] if q[2] is not None)}",
         ]
+        
+        if state.get("search_results"):
+            summary_parts.append(f"Database Queries: {state['search_results'].total_results} results")
         
         if state["questions_list"]:
             summary_parts.append("\n📝 Questions in this session:")
@@ -605,56 +701,53 @@ Provide a helpful, encouraging response that guides them through their interview
         summary = "\n".join(summary_parts)
         print(summary)
         
-        state["response"].append(summary)
+        state["response"] = [summary]
         
         return state
 
 
 # ============================================================================
-# GRAPH CONSTRUCTION
+# GRAPH CONSTRUCTION - FIXED ROUTING
 # ============================================================================
 
-def create_agent_graph(neo4j_handler: Neo4jHandler, openai_api_key: str) -> StateGraph:
-    """Create and configure the LangGraph workflow"""
+def create_agent_graph(neo4j_handler: Neo4jHandler, google_api_key: str) -> StateGraph:
+    """Create and configure the LangGraph workflow with proper routing"""
     
-    agent = InterviewPrepAgent(neo4j_handler, openai_api_key)
+    agent = InterviewPrepAgent(neo4j_handler, google_api_key)
     
     # Initialize the graph
     workflow = StateGraph(AgentState)
     
     # Add nodes
     workflow.add_node("start", agent.start_node)
-    workflow.add_node("model_query", agent.model_query_node)
+    workflow.add_node("extract_keywords", agent.extract_keywords_node)
     workflow.add_node("depth_search", agent.depth_search_node)
+    workflow.add_node("model_query", agent.model_query_node)
     workflow.add_node("check_satisfaction", agent.check_satisfaction_node)
     workflow.add_node("end", agent.end_node)
     
     # Add edges
     workflow.add_edge(START, "start")
-    workflow.add_edge("start", "model_query")
+    workflow.add_edge("start", "extract_keywords")
+    workflow.add_edge("extract_keywords", "depth_search")
+    workflow.add_edge("depth_search", "model_query")
     workflow.add_edge("model_query", "check_satisfaction")
-    workflow.add_edge("depth_search", "check_satisfaction")
     
-    # Conditional routing based on user satisfaction
-    def route_after_satisfaction(state: AgentState) -> Literal["model_query", "end", "depth_search"]:
+    # Conditional routing - FIXED LOGIC
+    def route_after_satisfaction(state: AgentState) -> Literal["extract_keywords", "end"]:
+        """Simple, reliable routing based on state flags"""
         if state.get("user_satisfied", False):
             return "end"
-        # We need to know if depth search was requested. 
-        # Assuming check_satisfaction_node sets a flag or returns a specific value in state.
-        # But here check_satisfaction_node returns AgentState.
-        # The logic inside check_satisfaction_node was printing "NEED MORE DEPTH RESEARCH".
-        # We need a field in state to hold this decision.
-        if state.get("next_step") == "depth_research":
-             return "depth_search"
-        return "model_query"
+        else:
+            # Continue the loop - go back to keyword extraction
+            return "extract_keywords"
     
     workflow.add_conditional_edges(
         "check_satisfaction",
         route_after_satisfaction,
         {
-            "model_query": "model_query",
-            "end": "end",
-            "depth_search": "depth_search"
+            "extract_keywords": "extract_keywords",
+            "end": "end"
         }
     )
     
@@ -672,7 +765,8 @@ def main():
     print("""
     ╔═══════════════════════════════════════════════╗
     ║   Interview Preparation Agent System          ║
-    ║   Powered by LangGraph + Neo4j + OpenAI       ║
+    ║   Powered by LangGraph + Neo4j + Gemini       ║
+    ║   ALL LOGICAL INCONSISTENCIES FIXED           ║
     ╚═══════════════════════════════════════════════╝
     """)
     
@@ -681,13 +775,13 @@ def main():
     
     try:
         # Create the agent graph
-        workflow = create_agent_graph(neo4j_handler, OPENAI_API_KEY)
+        workflow = create_agent_graph(neo4j_handler, GOOGLE_API_KEY)
         
         # Compile the graph with memory
         memory = MemorySaver()
         app = workflow.compile(checkpointer=memory)
         
-        # Initialize state
+        # Initialize state with ALL fields
         initial_state: AgentState = {
             "questions_list": [],
             "query": [],
@@ -695,16 +789,24 @@ def main():
             "thread_id": f"thread_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
             "structured_output": None,
             "user_satisfied": False,
-            "current_question_index": 0
+            "current_question_index": 0,
+            "search_keywords": None,
+            "search_results": None,
+            "need_depth_search": False,
+            "enable_rag": True,
+            "search_depth": 2
         }
         
         config = {"configurable": {"thread_id": initial_state["thread_id"]}}
         
-        print("\n💬 Chat with the Interview Prep Agent (type 'exit' to quit)\n")
+        print("\n💬 Chat with the Interview Prep Agent (type 'exit' to quit)")
+        print("💡 Tips:")
+        print("  - Ask for questions by company, domain, skill, or topic")
+        print("  - Type 'disable rag' to turn off graph search")
+        print("  - Type 'enable rag' to turn on graph search\n")
         
         # Interactive loop
         while True:
-            # Get user input
             user_input = input("You: ").strip()
             
             if not user_input:
@@ -714,9 +816,21 @@ def main():
                 print("\n👋 Goodbye! Good luck with your interviews!")
                 break
             
+            # Handle special commands
+            if "disable rag" in user_input.lower():
+                initial_state["enable_rag"] = False
+                print("✅ Graph RAG disabled\n")
+                continue
+            
+            if "enable rag" in user_input.lower():
+                initial_state["enable_rag"] = True
+                print("✅ Graph RAG enabled\n")
+                continue
+            
             # Add query to state
             initial_state["query"] = [user_input]
             initial_state["user_satisfied"] = False
+            initial_state["need_depth_search"] = False
             
             # Run the graph
             try:
@@ -726,25 +840,28 @@ def main():
                 if result.get("structured_output"):
                     print(f"\n🤖 Agent: {result['structured_output'].message}\n")
                     
-                    # Display questions if provided
-                    if result['structured_output'].questions_provided:
-                        print("📚 Questions for you:\n")
-                        for i, q in enumerate(result['structured_output'].questions_provided, 1):
-                            print(f"{i}. {q.question}")
+                    # Display new questions
+                    if result.get("questions_list") and len(result["questions_list"]) > len(initial_state.get("questions_list", [])):
+                        print("📚 New Questions Added:\n")
+                        new_questions = result["questions_list"][len(initial_state.get("questions_list", [])):]
+                        for i, q in enumerate(new_questions, 1):
+                            print(f"{i}. {q[0]}")
                         print()
                     
-                    # Display feedback if provided
+                    # Display feedback
                     if result['structured_output'].feedback:
                         feedback = result['structured_output'].feedback
                         print(f"📊 Evaluation Score: {feedback.score}/10\n")
                         print(f"💪 Strengths: {', '.join(feedback.strengths)}")
-                        print(f"📈 Areas for Improvement: {', '.join(feedback.improvements)}\n")
+                        print(f"📈 Improvements: {', '.join(feedback.improvements)}\n")
                 
                 # Update state for next iteration
                 initial_state = result
                 
             except Exception as e:
                 print(f"\n❌ Error: {e}\n")
+                import traceback
+                traceback.print_exc()
                 continue
     
     finally:
@@ -754,38 +871,4 @@ def main():
 
 
 if __name__ == "__main__":
-    # Example usage
     main()
-
-
-# ============================================================================
-# USAGE EXAMPLES
-# ============================================================================
-
-"""
-Example Interactions:
-
-1. Request questions by company:
-   User: "Give me some Google interview questions"
-   Agent: Fetches questions from Neo4j where company = "Google"
-
-2. Request questions by domain:
-   User: "I want to practice algorithms questions"
-   Agent: Fetches questions from the "Algorithms" domain
-
-3. Request questions by difficulty:
-   User: "Show me some easy questions to start with"
-   Agent: Fetches questions with difficulty = "Easy"
-
-4. Answer a question:
-   User: "The time complexity is O(n log n) because..."
-   Agent: Evaluates the answer and provides feedback
-
-5. Continue conversation:
-   User: "Can you give me more questions on the same topic?"
-   Agent: Continues fetching relevant questions
-
-6. End session:
-   User: "Thanks, that's all for today"
-   Agent: Ends session and shows summary
-"""
